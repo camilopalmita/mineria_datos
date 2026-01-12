@@ -57,7 +57,7 @@
   },
 
   "postCreateCommand": "bash .devcontainer/postCreate.sh",
-  "updateContentCommand": "uv sync --locked",
+  "postStartCommand": "sleep 2",
 
   "forwardPorts": [4200],
   "portsAttributes": {
