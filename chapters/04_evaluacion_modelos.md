@@ -540,11 +540,3 @@ Esto significa que debería intervenir con cualquier cliente que tenga más del 
 2. **El umbral de decisión no es 0.5**: El umbral óptimo lo determina la relación entre el costo de retención y el valor de un cliente, no una convención estadística. La fórmula $t^* = C / LTV$ da una primera aproximación analítica.
 
 3. **Dos modelos con igual AUC pueden tener beneficios financieros radicalmente distintos**: Lo que importa no es el área bajo la curva sino el valor del punto específico de la curva donde operamos en producción.
-
-### Conexión con el Siguiente Capítulo
-
-Ahora que tenemos las herramientas para **evaluar** cualquier modelo de clasificación en términos financieros, estamos listos para aprender **nuevos modelos** que podremos evaluar con exactamente este mismo framework.
-
-El Capítulo 4 introduce los **Árboles de Decisión**: modelos que, a diferencia de la Regresión Logística, no asumen ninguna forma funcional para separar las clases. Son completamente interpretables, soportan relaciones no lineales y producen reglas de negocio en lenguaje casi natural.
-
-Aplicaremos las Curvas de Beneficio y los Lift Charts del Capítulo 3 para comparar si un Árbol de Decisión supera a la Regresión Logística en el caso de Churn, cerrando el ciclo entre modelado, evaluación y valor de negocio.
