@@ -1006,3 +1006,266 @@ plt.show()
 - Árbol de decisión crea fronteras rectangulares que aproximan la línea
 - Para relaciones lineales, la regresión logística es más eficiente
 - Para relaciones no lineales, los árboles son más flexibles
+:::
+
+## Optimización de Hiperparámetros con Optuna
+
+Hasta ahora hemos elegido los hiperparámetros del árbol (como `max_depth` o `min_samples_leaf`) de forma manual o por intuición. Pero, ¿cómo saber cuál combinación es realmente la mejor? Necesitamos un proceso sistemático.
+
+### El problema: el espacio de búsqueda crece exponencialmente
+
+Un árbol de decisión tiene varios hiperparámetros que interactúan entre sí. Si intentamos probar todas las combinaciones posibles, el número de experimentos se dispara rápidamente:
+
+| Hiperparámetro | Valores a probar | Opciones |
+|---|---|:---:|
+| `criterion` | gini, entropy | 2 |
+| `max_depth` | 1, 2, 3, …, 15 | 15 |
+| `min_samples_split` | 2, 5, 10, 20, 50 | 5 |
+| `min_samples_leaf` | 1, 2, 5, 10 | 4 |
+| `max_features` | sqrt, log2, None | 3 |
+
+**Total de combinaciones:** $2 \times 15 \times 5 \times 4 \times 3 = \mathbf{1{,}800}$ experimentos.
+
+Si cada experimento tarda 1 segundo, son 30 minutos solo para un árbol simple. Para modelos más complejos explorar todo el espacio se vuelve inviable.
+
+### Grid Search: la búsqueda exhaustiva
+
+El enfoque tradicional es el **Grid Search**: definir una cuadrícula de valores y probar todas las combinaciones. Es garantizado pero ciego — prueba combinaciones malas con la misma dedicación que las buenas.
+
+```{python}
+#| label: grid-search-baseline
+#| echo: true
+
+from sklearn.model_selection import GridSearchCV, cross_val_score
+import numpy as np
+import warnings
+warnings.filterwarnings('ignore')
+
+# Grid pequeño para ilustrar el costo
+param_grid = {
+    'max_depth': [2, 4, 6, 8, 10],
+    'min_samples_split': [2, 10, 20],
+    'min_samples_leaf': [1, 5, 10],
+    'criterion': ['gini', 'entropy'],
+}
+
+from sklearn.tree import DecisionTreeClassifier
+from sklearn.model_selection import train_test_split
+from sklearn.datasets import make_classification
+
+np.random.seed(42)
+X, y = make_classification(
+    n_samples=500, n_features=10, n_informative=5,
+    n_redundant=2, random_state=42
+)
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.3, random_state=42
+)
+
+grid_search = GridSearchCV(
+    DecisionTreeClassifier(random_state=42),
+    param_grid,
+    cv=5,
+    scoring='accuracy',
+    n_jobs=-1
+)
+grid_search.fit(X_train, y_train)
+
+print(f"Combinaciones evaluadas: {len(grid_search.cv_results_['mean_test_score'])}")
+print(f"Mejor score CV:          {grid_search.best_score_:.4f}")
+print(f"Score en test:           {grid_search.score(X_test, y_test):.4f}")
+print(f"\nMejores hiperparámetros:")
+for k, v in grid_search.best_params_.items():
+    print(f"  {k}: {v}")
+```
+
+Con solo 5 valores por hiperparámetro ya evaluamos 90 combinaciones. El problema real es que Grid Search **no aprende**: si las primeras 10 pruebas muestran que `max_depth > 8` siempre da resultados malos, el Grid Search sigue probando esos valores igual. Optuna no.
+
+### Optuna: búsqueda inteligente
+
+**Optuna** es una librería de optimización de hiperparámetros que aprende de los intentos anteriores para decidir qué combinación probar a continuación. En lugar de una cuadrícula fija, usa un algoritmo llamado **TPE (Tree-structured Parzen Estimator)** que modela qué regiones del espacio de búsqueda son prometedoras. La idea central: después de cada trial, Optuna actualiza su modelo interno de "qué funciona" y propone el siguiente trial en zonas del espacio que parecen más prometedoras. Esto se llama **optimización bayesiana**.
+
+### Cómo funciona TPE
+
+TPE (Tree-structured Parzen Estimator) es el algoritmo que Optuna usa por defecto para decidir qué hiperparámetros probar a continuación. El nombre suena intimidante, pero la idea es sorprendentemente intuitiva.
+
+**La pregunta que TPE responde en cada paso:**
+
+> "¿En qué parte del espacio de hiperparámetros han vivido los buenos resultados, y en qué parte los malos?"
+
+#### Paso 1: los primeros trials son aleatorios
+
+Al principio no hay información, así que Optuna muestrea aleatoriamente. Estos primeros trials son la "exploración inicial" — sirven para mapear el territorio.
+
+```
+Trial  1: max_depth=12, min_samples_leaf=3  → accuracy = 0.81
+Trial  2: max_depth=2,  min_samples_leaf=15 → accuracy = 0.74
+Trial  3: max_depth=7,  min_samples_leaf=1  → accuracy = 0.83
+Trial  4: max_depth=18, min_samples_leaf=8  → accuracy = 0.77
+Trial  5: max_depth=5,  min_samples_leaf=4  → accuracy = 0.86
+...
+```
+
+#### Paso 2: dividir en "buenos" y "malos"
+
+Después de acumular suficientes trials, TPE los divide en dos grupos usando un umbral $\gamma$ (típicamente el top 25%):
+
+- **$l(x)$** — distribución de los hiperparámetros donde el score fue **bueno** (top 25%)
+- **$g(x)$** — distribución de los hiperparámetros donde el score fue **malo** (el resto)
+
+Siguiendo el ejemplo: si $\gamma = 0.25$ y tenemos 5 trials, el "bueno" es el Trial 5 (accuracy = 0.86) y los "malos" son los otros cuatro.
+
+TPE ajusta una distribución de probabilidad sobre cada grupo. Para variables continuas usa una mezcla de distribuciones gaussianas (Parzen window); para variables categóricas usa distribuciones discretas — de ahí el "Parzen Estimator" en el nombre.
+
+#### Paso 3: proponer el siguiente punto
+
+Para el siguiente trial, TPE busca el punto $x^*$ que **maximiza la razón**:
+
+$$x^* = \arg\max_x \frac{l(x)}{g(x)}$$
+
+Esto es elegante: queremos valores de hiperparámetros que sean **muy probables bajo los buenos resultados** y **poco probables bajo los malos**. Un $x$ con $l(x)/g(x)$ alto es prometedor porque vive en la zona de los ganadores y lejos de la zona de los perdedores.
+
+#### La intuición completa en una imagen mental
+
+Imagina que estás buscando petróleo en un mapa. Después de perforar en varios lugares:
+
+- Marcas en **verde** los pozos que dieron petróleo (los buenos)
+- Marcas en **rojo** los que no dieron nada (los malos)
+
+Grid Search perforaría en una cuadrícula fija, ignorando tus resultados previos. TPE, en cambio, mira el mapa y dice: *"los pozos buenos se concentran en el noroeste, los malos en el sureste — el próximo pozo va al noroeste, pero un poco más al norte de lo que ya probé"*.
+
+Con cada nuevo trial, el mapa se actualiza y la búsqueda se vuelve más precisa.
+
+::: {.callout-note}
+## ¿Por qué "Tree-structured"?
+
+El "Tree-structured" no se refiere a árboles de decisión. Se refiere a que cuando hay múltiples hiperparámetros, TPE los modela con una estructura de árbol de dependencias: algunos hiperparámetros solo son relevantes cuando otro toma cierto valor (por ejemplo, `min_impurity_decrease` solo importa si el árbol tiene cierta profundidad). TPE respeta estas dependencias condicionales.
+:::
+
+## Implementación
+
+Los tres conceptos clave:
+
+| Concepto | Significado |
+|---|---|
+| **Study** | El experimento completo — el proceso de optimización |
+| **Trial** | Un intento individual — una combinación de hiperparámetros |
+| **Objective** | La función que queremos maximizar (o minimizar) |
+
+```{python}
+#| label: optuna-intro
+#| echo: true
+
+import optuna
+optuna.logging.set_verbosity(optuna.logging.WARNING)  # suprimir logs intermedios
+
+from sklearn.model_selection import cross_val_score
+
+def objective(trial):
+    """
+    Esta función define UN trial: Optuna elige los hiperparámetros,
+    nosotros entrenamos el modelo y regresamos el score a optimizar.
+    """
+    # Optuna sugiere valores dentro de los rangos que le indicamos
+    params = {
+        'criterion': trial.suggest_categorical('criterion', ['gini', 'entropy']),
+        'max_depth': trial.suggest_int('max_depth', 1, 20),
+        'min_samples_split': trial.suggest_int('min_samples_split', 2, 50),
+        'min_samples_leaf': trial.suggest_int('min_samples_leaf', 1, 20),
+        'max_features': trial.suggest_categorical('max_features', ['sqrt', 'log2', None]),
+        'ccp_alpha': trial.suggest_float('ccp_alpha', 0.0, 0.05),
+    }
+
+    model = DecisionTreeClassifier(random_state=42, **params)
+
+    # Usamos cross-validation para una estimación robusta del desempeño
+    scores = cross_val_score(model, X_train, y_train, cv=5, scoring='accuracy')
+    return scores.mean()
+
+
+# Crear el estudio y optimizar
+study = optuna.create_study(direction='maximize')  # queremos maximizar accuracy
+study.optimize(objective, n_trials=100)
+
+print(f"Trials completados:  {len(study.trials)}")
+print(f"Mejor score CV:      {study.best_value:.4f}")
+print(f"\nMejores hiperparámetros encontrados:")
+for k, v in study.best_params.items():
+    print(f"  {k}: {v}")
+```
+
+```{python}
+#| label: optuna-results
+#| fig-cap: "Evolución del score a lo largo de los trials de Optuna"
+#| fig-width: 12
+#| fig-height: 5
+#| echo: true
+
+import matplotlib.pyplot as plt
+
+# Extraer historial de trials
+trial_values = [t.value for t in study.trials]
+best_so_far = np.maximum.accumulate(trial_values)
+
+fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+
+# Panel 1: score por trial + mejor acumulado
+axes[0].scatter(range(len(trial_values)), trial_values,
+                alpha=0.4, s=20, color='steelblue', label='Score del trial')
+axes[0].plot(range(len(best_so_far)), best_so_far,
+             color='red', linewidth=2, label='Mejor hasta ahora')
+axes[0].axhline(y=grid_search.best_score_, color='green', linestyle='--',
+                linewidth=1.5, label=f'Grid Search ({grid_search.best_score_:.4f})')
+axes[0].set_xlabel('Número de trial', fontsize=11)
+axes[0].set_ylabel('Accuracy (CV 5-fold)', fontsize=11)
+axes[0].set_title('Optuna: evolución de la búsqueda', fontsize=12)
+axes[0].legend(fontsize=9)
+axes[0].grid(True, alpha=0.3)
+
+# Panel 2: importancia de hiperparámetros según Optuna
+importances = optuna.importance.get_param_importances(study)
+param_names = list(importances.keys())
+param_vals = list(importances.values())
+
+axes[1].barh(param_names, param_vals, color='steelblue', alpha=0.8)
+axes[1].set_xlabel('Importancia relativa', fontsize=11)
+axes[1].set_title('¿Qué hiperparámetro importa más?', fontsize=12)
+axes[1].grid(True, alpha=0.3, axis='x')
+
+plt.tight_layout()
+plt.show()
+```
+
+```{python}
+#| label: optuna-comparison
+#| echo: true
+
+# Evaluar el mejor modelo de Optuna en test
+best_model = DecisionTreeClassifier(random_state=42, **study.best_params)
+best_model.fit(X_train, y_train)
+optuna_test_score = best_model.score(X_test, y_test)
+
+print("=" * 55)
+print(f"{'Método':<25} {'CV Score':>10} {'Test Score':>12}")
+print("-" * 55)
+print(f"{'Sin optimizar (default)':<25} {cross_val_score(DecisionTreeClassifier(random_state=42), X_train, y_train, cv=5).mean():>10.4f} {DecisionTreeClassifier(random_state=42).fit(X_train, y_train).score(X_test, y_test):>12.4f}")
+print(f"{'Grid Search':<25} {grid_search.best_score_:>10.4f} {grid_search.score(X_test, y_test):>12.4f}")
+print(f"{'Optuna (100 trials)':<25} {study.best_value:>10.4f} {optuna_test_score:>12.4f}")
+print("=" * 55)
+```
+
+### Interpretando los resultados
+
+La gráfica de **importancia de hiperparámetros** (panel derecho) revela algo valioso: no todos los hiperparámetros importan igual. En los árboles, `max_depth` y `min_samples_leaf` suelen dominar porque controlan directamente la complejidad del modelo. `criterion` (gini vs entropy) rara vez hace diferencia notable.
+
+Este diagnóstico es útil para todos los modelos que veremos después: cuando llegues a XGBoost con decenas de hiperparámetros, Optuna te dirá en cuáles vale la pena concentrarte.
+
+::: {.callout-tip}
+## Reglas prácticas para usar Optuna
+
+1. **Empieza con rangos amplios** — deja que Optuna explore; puedes afinar después
+2. **Usa `cross_val_score` en la objective**, no train/test directo — evita sobreajustar al conjunto de validación
+3. **50-200 trials** suelen ser suficientes para modelos simples; para XGBoost o redes neuronales considera más
+4. **Lee la importancia de hiperparámetros** antes de hacer una segunda ronda de búsqueda más fina
+5. **`direction='maximize'`** para métricas como accuracy, AUC, F1; **`direction='minimize'`** para errores como MSE
+:::
