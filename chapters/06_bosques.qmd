@@ -1,0 +1,677 @@
+# Métodos de Ensemble: Bagging y Random Forest
+
+## Motivación: el problema de la varianza
+
+En el capítulo anterior vimos que los árboles de decisión son modelos flexibles capaces de capturar relaciones complejas. Sin embargo, tienen una debilidad fundamental: **alta varianza**. Un árbol entrenado en un conjunto de datos puede verse completamente diferente si le cambias unas pocas observaciones.
+
+Para ilustrarlo, considera lo siguiente:
+
+```{python}
+#| label: variance-motivation
+#| fig-cap: "Alta varianza de los árboles: dos muestras ligeramente distintas generan árboles muy diferentes"
+#| fig-width: 13
+#| fig-height: 5
+#| echo: true
+
+import numpy as np
+import matplotlib.pyplot as plt
+from sklearn.tree import DecisionTreeClassifier, plot_tree
+from sklearn.datasets import make_moons
+
+np.random.seed(42)
+X, y = make_moons(n_samples=150, noise=0.3, random_state=42)
+
+# Muestras bootstrap del mismo tamaño (con reemplazo) — como hace Bagging
+idx1 = np.random.choice(len(X), size=len(X), replace=True)
+idx2 = np.random.choice(len(X), size=len(X), replace=True)
+
+# Sin límite de profundidad: árboles completos tienen máxima varianza
+tree1 = DecisionTreeClassifier(random_state=1)
+tree2 = DecisionTreeClassifier(random_state=2)
+tree1.fit(X[idx1], y[idx1])
+tree2.fit(X[idx2], y[idx2])
+
+h = 0.03
+x_min, x_max = X[:, 0].min() - 0.5, X[:, 0].max() + 0.5
+y_min, y_max = X[:, 1].min() - 0.5, X[:, 1].max() + 0.5
+xx, yy = np.meshgrid(np.arange(x_min, x_max, h), np.arange(y_min, y_max, h))
+
+fig, axes = plt.subplots(1, 2, figsize=(13, 5))
+for ax, tree, title in zip(axes, [tree1, tree2], ['Árbol 1 (muestra A)', 'Árbol 2 (muestra B)']):
+    Z = tree.predict(np.c_[xx.ravel(), yy.ravel()]).reshape(xx.shape)
+    ax.contourf(xx, yy, Z, alpha=0.35, cmap='RdBu_r')
+    ax.scatter(X[:, 0], X[:, 1], c=y, cmap='RdBu_r', edgecolors='black', s=40)
+    ax.set_title(title, fontsize=13)
+    ax.set_xlabel('X1'); ax.set_ylabel('X2')
+    ax.grid(True, alpha=0.3)
+
+plt.tight_layout()
+plt.show()
+
+# Diferencia en predicciones
+pred1 = tree1.predict(X)
+pred2 = tree2.predict(X)
+desacuerdo = (pred1 != pred2).mean()
+print(f"Porcentaje de desacuerdo entre los dos árboles: {desacuerdo:.1%}")
+```
+
+Los dos árboles fueron entrenados con muestras casi idénticas y producen fronteras de decisión muy distintas. Esto es la **varianza** en acción: el modelo es demasiado sensible a las particularidades del conjunto de entrenamiento.
+
+La solución intuitiva es simple: **si un árbol tiene mucha varianza, ¿qué tal si entrenamos muchos árboles y promediamos sus predicciones?** Pero para hacerlo necesitamos generar múltiples versiones del conjunto de entrenamiento a partir de los datos que ya tenemos. Ahí entra el **bootstrap**.
+
+---
+
+## Bootstrap
+
+El **bootstrap** es una técnica de remuestreo que permite estimar la variabilidad de un estadístico sin asumir una distribución paramétrica, y sin necesidad de recolectar más datos.
+
+La idea es: dado un conjunto de $n$ observaciones, genera muestras artificiales del mismo tamaño $n$ tomando observaciones **con reemplazo**. Cada muestra resultante se llama **muestra bootstrap**.
+
+```
+Dataset original: [A, B, C, D, E]   (n = 5)
+
+Muestra bootstrap 1: [B, B, A, D, A]   ← B y A aparecen dos veces; C y E ausentes
+Muestra bootstrap 2: [C, E, E, A, D]   ← E aparece dos veces; B ausente
+Muestra bootstrap 3: [A, C, B, B, C]   ← B y C aparecen dos veces; D y E ausentes
+```
+
+### La propiedad del 63.2%
+
+¿Qué fracción de las observaciones originales aparece en una muestra bootstrap? La probabilidad de que una observación **no sea seleccionada** en ninguno de los $n$ sorteos es:
+
+$$P(\text{no seleccionada}) = \left(1 - \frac{1}{n}\right)^n \xrightarrow{n \to \infty} e^{-1} \approx 0.368$$
+
+Por lo tanto, cada muestra bootstrap contiene en promedio $\approx 63.2\%$ de las observaciones originales (distintas), y el restante $\approx 36.8\%$ queda **fuera de la muestra** (*out-of-bag*, OOB).
+
+```{python}
+#| label: bootstrap-intro
+#| fig-cap: "Propiedades del muestreo bootstrap: fracción única y distribución OOB"
+#| fig-width: 13
+#| fig-height: 5
+#| echo: true
+
+import numpy as np
+import matplotlib.pyplot as plt
+
+rng = np.random.default_rng(42)
+
+n = 200
+B = 500
+fracciones_unicas = []
+conteo_apariciones = np.zeros(n, dtype=int)
+
+for _ in range(B):
+    muestra = rng.integers(0, n, size=n)
+    fracciones_unicas.append(len(np.unique(muestra)) / n)
+    conteo_apariciones += np.bincount(muestra, minlength=n)
+
+fig, axes = plt.subplots(1, 2, figsize=(13, 5))
+
+# Panel 1: distribución de fracción de observaciones únicas
+axes[0].hist(fracciones_unicas, bins=25, color='steelblue', alpha=0.8, edgecolor='white')
+axes[0].axvline(x=np.mean(fracciones_unicas), color='red', linewidth=2,
+                label=f'Media = {np.mean(fracciones_unicas):.3f}')
+axes[0].axvline(x=1 - 1/np.e, color='black', linewidth=2, linestyle='--',
+                label=f'Límite teórico = {1 - 1/np.e:.3f}')
+axes[0].set_xlabel('Fracción de observaciones únicas por muestra bootstrap', fontsize=11)
+axes[0].set_ylabel('Frecuencia (sobre 500 muestras)', fontsize=11)
+axes[0].set_title('¿Qué fracción de datos incluye cada bootstrap?', fontsize=12)
+axes[0].legend(fontsize=10)
+axes[0].grid(True, alpha=0.3)
+
+# Panel 2: número de veces que aparece cada observación
+axes[1].bar(range(n), np.sort(conteo_apariciones), color='tomato', alpha=0.8, width=1.0)
+axes[1].axhline(y=B, color='black', linewidth=1.5, linestyle='--',
+                label=f'Aparece en todos los bootstraps (B={B})')
+axes[1].axhline(y=0, color='gray', linewidth=1)
+oob_count = (conteo_apariciones == 0).sum()
+axes[1].set_xlabel('Observaciones (ordenadas por frecuencia)', fontsize=11)
+axes[1].set_ylabel(f'Veces que aparece (sobre {B} muestras)', fontsize=11)
+axes[1].set_title(f'Frecuencia de aparición de cada observación\n'
+                  f'({oob_count} observaciones nunca aparecieron en ningún bootstrap)',
+                  fontsize=11)
+axes[1].legend(fontsize=10)
+axes[1].grid(True, alpha=0.3, axis='y')
+
+plt.tight_layout()
+plt.show()
+
+print(f"Fracción media de obs. únicas por bootstrap: {np.mean(fracciones_unicas):.4f}")
+print(f"Límite teórico (1 - 1/e):                    {1 - 1/np.e:.4f}")
+```
+
+### Ejemplo: estimación de la media con bootstrap
+
+Un uso clásico del bootstrap es estimar la **distribución muestral** de un estadístico cuando no conocemos su fórmula analítica (o no queremos asumir normalidad).
+
+El procedimiento es siempre el mismo:
+
+1. Calcula el estadístico de interés en los datos originales → $\hat{\theta}$
+2. Genera $B$ muestras bootstrap y calcula el estadístico en cada una → $\hat{\theta}_1^*, \ldots, \hat{\theta}_B^*$
+3. La distribución de $\{\hat{\theta}_b^*\}$ aproxima la distribución muestral de $\hat{\theta}$
+
+```{python}
+#| label: bootstrap-mean
+#| fig-cap: "Distribución bootstrap de la media: converge a la distribución muestral teórica"
+#| fig-width: 13
+#| fig-height: 5
+#| echo: true
+
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy import stats
+
+rng = np.random.default_rng(0)
+
+# Datos originales: muestra de ingresos mensuales (distribución asimétrica)
+n = 80
+datos = rng.exponential(scale=15_000, size=n)   # media teórica = 15,000
+media_muestral = datos.mean()
+
+# Bootstrap
+B = 2000
+medias_bootstrap = np.array([
+    rng.choice(datos, size=n, replace=True).mean()
+    for _ in range(B)
+])
+
+# Intervalo de confianza bootstrap (percentil 2.5 y 97.5)
+ic_low, ic_high = np.percentile(medias_bootstrap, [2.5, 97.5])
+
+# Distribución teórica del estimador (CLT): Normal(media, std/sqrt(n))
+x_range = np.linspace(medias_bootstrap.min(), medias_bootstrap.max(), 300)
+clt_density = stats.norm.pdf(x_range, loc=media_muestral, scale=datos.std() / np.sqrt(n))
+
+fig, axes = plt.subplots(1, 2, figsize=(13, 5))
+
+# Panel 1: distribución bootstrap vs. distribución teórica (CLT)
+axes[0].hist(medias_bootstrap, bins=50, density=True,
+             color='steelblue', alpha=0.7, label='Distribución bootstrap')
+axes[0].plot(x_range, clt_density, color='red', linewidth=2.5,
+             label='Normal teórica (CLT)')
+axes[0].axvline(x=media_muestral, color='black', linewidth=2,
+                label=f'Media muestral = {media_muestral:,.0f}')
+axes[0].axvline(x=15_000, color='gray', linewidth=1.5, linestyle=':',
+                label='Media verdadera = 15,000')
+axes[0].axvspan(ic_low, ic_high, alpha=0.15, color='steelblue',
+                label=f'IC 95%: [{ic_low:,.0f}, {ic_high:,.0f}]')
+axes[0].set_xlabel('Media bootstrap', fontsize=11)
+axes[0].set_ylabel('Densidad', fontsize=11)
+axes[0].set_title('Distribución bootstrap de la media\nvs. aproximación normal (CLT)', fontsize=12)
+axes[0].legend(fontsize=9)
+axes[0].grid(True, alpha=0.3)
+
+# Panel 2: convergencia del error estándar bootstrap con B
+B_vals = [10, 25, 50, 100, 250, 500, 1000, 2000]
+se_bootstrap = [
+    rng.choice(datos, size=(b, n), replace=True).mean(axis=1).std()
+    for b in B_vals
+]
+se_teorico = datos.std() / np.sqrt(n)
+
+axes[1].plot(B_vals, se_bootstrap, marker='o', linewidth=2,
+             color='steelblue', label='Error estándar bootstrap')
+axes[1].axhline(y=se_teorico, color='red', linewidth=2, linestyle='--',
+                label=f'Error estándar teórico = {se_teorico:,.1f}')
+axes[1].set_xlabel('Número de muestras bootstrap (B)', fontsize=11)
+axes[1].set_ylabel('Error estándar de la media', fontsize=11)
+axes[1].set_title('Convergencia del error estándar bootstrap', fontsize=12)
+axes[1].legend(fontsize=10)
+axes[1].grid(True, alpha=0.3)
+axes[1].set_xscale('log')
+
+plt.tight_layout()
+plt.show()
+
+print(f"Media muestral:              {media_muestral:>10,.1f}")
+print(f"Error estándar teórico:      {se_teorico:>10,.1f}")
+print(f"Error estándar bootstrap:    {medias_bootstrap.std():>10,.1f}")
+print(f"IC 95% bootstrap:            [{ic_low:,.0f}, {ic_high:,.0f}]")
+```
+
+Con $B \approx 500$–$1000$ muestras el error estándar bootstrap converge al teórico. Más importante: cuando el estadístico es complejo (una mediana, un coeficiente de correlación, un percentil), el bootstrap sigue funcionando igual aunque no exista fórmula analítica.
+
+::: {.callout-note}
+## ¿Para qué sirve el bootstrap más allá de Bagging?
+
+El bootstrap es una herramienta general de inferencia estadística. Se usa para:
+
+- **Estimar intervalos de confianza** de cualquier estadístico (media, mediana, correlación) sin asumir normalidad
+- **Estimar el error estándar** de un estimador complejo
+- **Validar modelos** (bootstrap `.632` es una alternativa a la validación cruzada)
+
+En este capítulo lo usamos específicamente para generar diversidad entre árboles, pero su utilidad es mucho más amplia.
+:::
+
+---
+
+## Bagging (Bootstrap Aggregating)
+
+### La idea central
+
+**Bagging** (Breiman, 1996) es la primera gran técnica de ensemble para árboles. La idea es:
+
+1. Genera $B$ muestras **bootstrap** del conjunto de entrenamiento (muestreo con reemplazo)
+2. Entrena un árbol completo (sin podar) en cada muestra
+3. Para predecir un punto nuevo, **promedia** (regresión) o toma la **moda** (clasificación) de las $B$ predicciones
+
+```
+Para b = 1 hasta B:
+  1. Samplear n observaciones con reemplazo → D*ᵦ  (~63.2% únicas)
+  2. Entrenar árbol completo T*ᵦ sobre D*ᵦ
+
+Predicción para x nuevo:
+  - Regresión:      ŷ(x) = (1/B) Σ T*ᵦ(x)
+  - Clasificación:  ŷ(x) = moda{ T*ᵦ(x) : b = 1...B }
+```
+
+### ¿Por qué funciona? La matemática del promedio
+
+Si tenemos $B$ predictores independientes, cada uno con varianza $\sigma^2(x)$, su promedio tiene varianza:
+
+$$\text{Var}\left[\frac{1}{B}\sum_{b=1}^B \hat{f}_b(x)\right] = \frac{\sigma^2(x)}{B}$$
+
+La varianza cae con $B$. En el límite, desaparece.
+
+Pero los árboles entrenados con muestras bootstrap del **mismo** dataset no son independientes: están correlacionados con coeficiente $\rho(x)$. La varianza real del promedio es:
+
+$$\text{Var}[\bar{T}(x)] = \rho(x)\,\sigma^2(x) + \frac{1 - \rho(x)}{B}\,\sigma^2(x)$$
+
+Cuando $B \to \infty$, el segundo término desaparece, pero el primero permanece. En otras palabras:
+
+> **Aumentar $B$ más allá de cierto punto no ayuda si los árboles están muy correlacionados.** El techo de la mejora es $\rho(x)\,\sigma^2(x)$.
+
+Esto motivará directamente la idea de Random Forest.
+
+::: {.callout-note}
+## Sesgo vs. Varianza en Bagging
+
+Bagging **no cambia el sesgo** de los árboles individuales. Un árbol completo tiene sesgo bajo y varianza alta; bagging mantiene el sesgo bajo y reduce la varianza. Por eso se usan árboles sin podar: queremos el sesgo mínimo y dejamos que el promedio controle la varianza.
+:::
+
+### Muestras Bootstrap y la propiedad OOB
+
+Cada muestra bootstrap incluye en promedio el $1 - (1 - 1/n)^n \approx 1 - 1/e \approx 63.2\%$ de las observaciones originales. El restante $\approx 36.8\%$ queda **fuera de la bolsa** (*Out-of-Bag*, OOB).
+
+Esto es una propiedad muy útil:
+
+> Para cada observación $i$, solo los árboles que **no** la usaron en entrenamiento emiten una predicción. El error OOB es el error promedio de esas predicciones "honestas", y es una estimación casi libre de sesgo del error de generalización.
+
+El error OOB equivale aproximadamente a la validación cruzada leave-one-out, pero mucho más barato de calcular.
+
+```{python}
+#| label: bagging-demo
+#| fig-cap: "Bagging reduce la varianza: comparación de errores a medida que crece B"
+#| fig-width: 12
+#| fig-height: 5
+#| echo: true
+
+from sklearn.ensemble import BaggingClassifier
+from sklearn.model_selection import train_test_split
+
+np.random.seed(42)
+X_tr, X_te, y_tr, y_te = train_test_split(X, y, test_size=0.3, random_state=42)
+
+B_values = [1, 3, 5, 10, 20, 50, 100, 200]
+train_errors, test_errors, oob_errors = [], [], []
+
+for B in B_values:
+    bag = BaggingClassifier(
+        estimator=DecisionTreeClassifier(),
+        n_estimators=B,
+        bootstrap=True,
+        oob_score=(B > 1),
+        random_state=42,
+        n_jobs=-1
+    )
+    bag.fit(X_tr, y_tr)
+    train_errors.append(1 - bag.score(X_tr, y_tr))
+    test_errors.append(1 - bag.score(X_te, y_te))
+    oob_errors.append(1 - bag.oob_score_ if B > 1 else None)
+
+fig, ax = plt.subplots(figsize=(8, 5))
+
+ax.plot(B_values, train_errors, marker='o', label='Error entrenamiento', linewidth=2)
+ax.plot(B_values, test_errors, marker='s', label='Error prueba', linewidth=2)
+oob_valid = [(b, e) for b, e in zip(B_values[1:], oob_errors[1:]) if e is not None]
+if oob_valid:
+    bs, es = zip(*oob_valid)
+    ax.plot(bs, es, marker='^', label='Error OOB', linewidth=2, linestyle='--')
+ax.axhline(y=1 - DecisionTreeClassifier().fit(X_tr, y_tr).score(X_te, y_te),
+           color='gray', linestyle=':', linewidth=1.5, label='Árbol simple (test)')
+ax.set_xlabel('Número de árboles (B)', fontsize=11)
+ax.set_ylabel('Tasa de error', fontsize=11)
+ax.set_title('Bagging: efecto de B en el error', fontsize=12)
+ax.legend(fontsize=9)
+ax.grid(True, alpha=0.3)
+
+plt.tight_layout()
+plt.show()
+```
+
+**Observaciones:**
+
+- A partir de ~50 árboles el error se estabiliza: más árboles no degradan el desempeño, solo lo estabilizan
+- El error OOB es una buena aproximación del error en test sin necesidad de un conjunto de validación separado
+
+---
+
+## Random Forest
+
+### La limitación de Bagging y su solución
+
+El análisis de la varianza mostró que el límite de Bagging es $\rho(x)\,\sigma^2(x)$, donde $\rho$ es la correlación entre árboles. Si todos los árboles se parecen mucho, la ganancia es pequeña.
+
+¿Por qué se parecen? Porque si hay una variable muy predictiva, **todos los árboles la usarán como primera división**. Los árboles comparten estructura.
+
+La solución de **Random Forest** (Breiman, 2001) es simple y brillante:
+
+> En cada división de cada árbol, en lugar de considerar **todas** las $p$ variables, selecciona aleatoriamente solo $m < p$ variables candidatas.
+
+Esto **decorrelaciona** los árboles: si la variable dominante queda fuera del sorteo en un nodo, otro predictor tendrá que tomar su lugar, forzando diversidad en la estructura de los árboles.
+
+### Algoritmo
+
+```
+Para b = 1 hasta B:
+  1. Generar muestra bootstrap D*ᵦ de tamaño n
+  2. Construir árbol T*ᵦ con la siguiente modificación:
+     En cada nodo de decisión:
+       a) Sortear m variables de las p totales (sin reemplazo)
+       b) Encontrar la mejor división usando solo esas m variables
+       c) Dividir el nodo
+  3. Crecer el árbol sin podar
+
+Predicción para x nuevo:
+  - Regresión:      ŷ(x) = (1/B) Σ T*ᵦ(x)
+  - Clasificación:  ŷ(x) = moda{ T*ᵦ(x) : b = 1...B }
+```
+
+### El parámetro m: el control de correlación
+
+El parámetro más importante de Random Forest es $m$, el número de variables candidatas por nodo:
+
+| Valor de m | Efecto |
+|:---:|:---|
+| $m = p$ | Equivale a Bagging (máxima correlación entre árboles) |
+| $m = \sqrt{p}$ | **Default para clasificación** — buen balance |
+| $m = p/3$ | **Default para regresión** |
+| $m = 1$ | Máxima decorrelación, pero árboles muy débiles (alto sesgo) |
+
+Reducir $m$ disminuye la correlación entre árboles (baja varianza del ensemble) pero hace que cada árbol individual sea peor (aumenta el sesgo). El óptimo está en el balance.
+
+::: {.callout-tip}
+## Regla práctica
+
+Para la mayoría de los problemas, los valores por defecto de scikit-learn funcionan bien:
+- Clasificación: `max_features='sqrt'`
+- Regresión: `max_features=1/3`
+
+El número de árboles (`n_estimators`) rara vez es el hiperparámetro más importante; 100-200 suele ser suficiente.
+:::
+
+### Bagging vs. Random Forest: la correlación en acción
+
+```{python}
+#| label: rf-vs-bagging
+#| fig-cap: "Random Forest vs. Bagging: comparación de errores y correlación entre árboles"
+#| fig-width: 13
+#| fig-height: 5
+#| echo: true
+
+from sklearn.ensemble import RandomForestClassifier, BaggingClassifier
+from sklearn.datasets import make_classification
+
+np.random.seed(42)
+X_cl, y_cl = make_classification(
+    n_samples=500, n_features=20, n_informative=10,
+    n_redundant=5, random_state=42
+)
+X_tr, X_te, y_tr, y_te = train_test_split(X_cl, y_cl, test_size=0.3, random_state=42)
+
+B_values = [1, 5, 10, 20, 50, 100, 200]
+bag_test, rf_test = [], []
+
+for B in B_values:
+    bag = BaggingClassifier(
+        estimator=DecisionTreeClassifier(), n_estimators=B,
+        bootstrap=True, random_state=42, n_jobs=-1
+    )
+    rf = RandomForestClassifier(n_estimators=B, random_state=42, n_jobs=-1)
+    bag.fit(X_tr, y_tr); rf.fit(X_tr, y_tr)
+    bag_test.append(1 - bag.score(X_te, y_te))
+    rf_test.append(1 - rf.score(X_te, y_te))
+
+fig, axes = plt.subplots(1, 2, figsize=(13, 5))
+
+axes[0].plot(B_values, bag_test, marker='o', label='Bagging', linewidth=2, color='steelblue')
+axes[0].plot(B_values, rf_test, marker='s', label='Random Forest', linewidth=2, color='tomato')
+axes[0].set_xlabel('Número de árboles (B)', fontsize=11)
+axes[0].set_ylabel('Tasa de error en prueba', fontsize=11)
+axes[0].set_title('Bagging vs. Random Forest', fontsize=12)
+axes[0].legend(fontsize=10)
+axes[0].grid(True, alpha=0.3)
+
+# Panel 2: correlación entre predicciones de árboles (200 árboles)
+rf_200 = RandomForestClassifier(n_estimators=200, random_state=42, n_jobs=-1)
+bag_200 = BaggingClassifier(
+    estimator=DecisionTreeClassifier(), n_estimators=200,
+    bootstrap=True, random_state=42, n_jobs=-1
+)
+rf_200.fit(X_tr, y_tr); bag_200.fit(X_tr, y_tr)
+
+rf_preds = np.array([t.predict(X_te) for t in rf_200.estimators_])
+bag_preds = np.array([t.predict(X_te) for t in bag_200.estimators_])
+
+corr_rf  = np.corrcoef(rf_preds)[np.triu_indices(200, k=1)].mean()
+corr_bag = np.corrcoef(bag_preds)[np.triu_indices(200, k=1)].mean()
+
+methods = ['Bagging', 'Random Forest']
+corrs = [corr_bag, corr_rf]
+colors = ['steelblue', 'tomato']
+bars = axes[1].bar(methods, corrs, color=colors, alpha=0.8, width=0.4)
+for bar, val in zip(bars, corrs):
+    axes[1].text(bar.get_x() + bar.get_width()/2, val + 0.005,
+                 f'ρ = {val:.3f}', ha='center', fontsize=12, fontweight='bold')
+axes[1].set_ylabel('Correlación media entre árboles (ρ)', fontsize=11)
+axes[1].set_title('Decorrelación entre árboles', fontsize=12)
+axes[1].set_ylim(0, max(corrs) * 1.2)
+axes[1].grid(True, alpha=0.3, axis='y')
+
+plt.tight_layout()
+plt.show()
+
+print(f"Correlación media entre árboles — Bagging: {corr_bag:.3f} | Random Forest: {corr_rf:.3f}")
+print(f"Error en test              — Bagging: {bag_test[-1]:.3f} | Random Forest: {rf_test[-1]:.3f}")
+```
+
+La diferencia es clara: Random Forest produce árboles menos correlacionados entre sí, y esa decorrelación se traduce directamente en mejor desempeño.
+
+---
+
+## Importancia de Variables en Random Forest
+
+Los árboles individuales ya tenían importancia de variables (MDI). En Random Forest se extiende naturalmente: se **promedia** la importancia MDI sobre todos los árboles del ensemble.
+
+$$\text{Importancia}(X_j) = \frac{1}{B}\sum_{b=1}^B \sum_{t \in T_b: \text{usa } X_j} \frac{n_t}{n}\,\Delta I(t)$$
+
+Al promediar sobre cientos de árboles, la estimación se vuelve mucho más **estable** que la de un árbol individual.
+
+### Permutation Importance (variante OOB)
+
+Random Forest habilita una variante especialmente conveniente de la permutation importance: en lugar de usar un conjunto de test separado, se usan las muestras **OOB** de cada árbol. Para medir la importancia de la variable $X_j$:
+
+1. Para cada árbol $b$, toma sus muestras OOB y calcula el error OOB normal
+2. Permuta (baraja) los valores de $X_j$ en esas muestras OOB y recalcula el error
+3. La importancia es el incremento promedio en error al permutar
+
+Esto no requiere reservar datos adicionales y es computacionalmente eficiente.
+
+```{python}
+#| label: rf-feature-importance
+#| fig-cap: "Importancia de variables en Random Forest: MDI vs. Permutation Importance"
+#| fig-width: 13
+#| fig-height: 5
+#| echo: true
+
+from sklearn.inspection import permutation_importance
+
+np.random.seed(42)
+X_fi, y_fi = make_classification(
+    n_samples=800, n_features=10, n_informative=5,
+    n_redundant=2, random_state=42
+)
+feat_names = [f'var_{i+1:02d}' for i in range(10)]
+
+X_tr_fi, X_te_fi, y_tr_fi, y_te_fi = train_test_split(
+    X_fi, y_fi, test_size=0.25, random_state=42
+)
+
+rf = RandomForestClassifier(n_estimators=200, random_state=42, n_jobs=-1, oob_score=True)
+rf.fit(X_tr_fi, y_tr_fi)
+
+# MDI
+mdi = rf.feature_importances_
+mdi_ord = np.argsort(mdi)[::-1]
+
+# Permutation importance (sobre test)
+perm = permutation_importance(rf, X_te_fi, y_te_fi, n_repeats=20, random_state=42, n_jobs=-1)
+perm_mean = perm.importances_mean
+perm_ord = np.argsort(perm_mean)[::-1]
+
+fig, axes = plt.subplots(1, 2, figsize=(13, 5))
+n_feat = len(feat_names)
+
+axes[0].barh(range(n_feat), mdi[mdi_ord], color='steelblue', alpha=0.8)
+axes[0].set_yticks(range(n_feat))
+axes[0].set_yticklabels([feat_names[i] for i in mdi_ord], fontsize=10)
+axes[0].set_xlabel('Importancia MDI (promedio entre árboles)', fontsize=10)
+axes[0].set_title('Importancia MDI\n(Random Forest)', fontsize=11)
+axes[0].grid(True, alpha=0.3, axis='x')
+for i, v in enumerate(mdi[mdi_ord]):
+    axes[0].text(v + 0.002, i, f'{v:.3f}', va='center', fontsize=9)
+
+axes[1].barh(range(n_feat), perm_mean[perm_ord],
+             xerr=perm.importances_std[perm_ord],
+             color='tomato', alpha=0.8, capsize=4)
+axes[1].set_yticks(range(n_feat))
+axes[1].set_yticklabels([feat_names[i] for i in perm_ord], fontsize=10)
+axes[1].set_xlabel('Caída en accuracy al permutar', fontsize=10)
+axes[1].set_title('Permutation Importance\n(sobre test)', fontsize=11)
+axes[1].axvline(x=0, color='black', linewidth=0.8)
+axes[1].grid(True, alpha=0.3, axis='x')
+
+plt.suptitle(f'Random Forest (200 árboles) — Accuracy test: {rf.score(X_te_fi, y_te_fi):.3f} | OOB: {rf.oob_score_:.3f}',
+             fontsize=12)
+plt.tight_layout()
+plt.show()
+```
+
+---
+
+## Hiperparámetros de Random Forest
+
+Los principales hiperparámetros a considerar son:
+
+| Parámetro | Descripción | Default | Impacto |
+|---|---|:---:|:---|
+| `n_estimators` | Número de árboles $B$ | 100 | Más → más estable, jamás empeora |
+| `max_features` | Variables por nodo $m$ | `'sqrt'` | Controla la decorrelación |
+| `max_depth` | Profundidad máxima | `None` | `None` = árboles completos (recomendado) |
+| `min_samples_leaf` | Min. muestras en hoja | 1 (clf) / 5 (reg) | Regulariza los árboles individuales |
+| `bootstrap` | Usar muestras bootstrap | `True` | `False` = Pasting (sin reemplazo) |
+
+### Comparación de desempeño: árbol simple vs. Bagging vs. Random Forest
+
+```{python}
+#| label: methods-comparison
+#| fig-cap: "Fronteras de decisión: árbol simple, Bagging y Random Forest"
+#| fig-width: 14
+#| fig-height: 5
+#| echo: true
+
+from sklearn.ensemble import BaggingClassifier, RandomForestClassifier
+from sklearn.tree import DecisionTreeClassifier
+from sklearn.model_selection import train_test_split
+
+np.random.seed(42)
+X_mc, y_mc = make_moons(n_samples=300, noise=0.25, random_state=42)
+X_tr_mc, X_te_mc, y_tr_mc, y_te_mc = train_test_split(
+    X_mc, y_mc, test_size=0.3, random_state=42
+)
+
+models = {
+    'Árbol de Decisión\n(max_depth=5)':
+        DecisionTreeClassifier(max_depth=5, random_state=42),
+    'Bagging\n(100 árboles)':
+        BaggingClassifier(estimator=DecisionTreeClassifier(),
+                          n_estimators=100, random_state=42, n_jobs=-1),
+    'Random Forest\n(100 árboles)':
+        RandomForestClassifier(n_estimators=100, random_state=42, n_jobs=-1),
+}
+
+h = 0.03
+x_min, x_max = X_mc[:, 0].min() - 0.5, X_mc[:, 0].max() + 0.5
+y_min, y_max = X_mc[:, 1].min() - 0.5, X_mc[:, 1].max() + 0.5
+xx, yy = np.meshgrid(np.arange(x_min, x_max, h), np.arange(y_min, y_max, h))
+
+fig, axes = plt.subplots(1, 3, figsize=(14, 5))
+
+for ax, (name, model) in zip(axes, models.items()):
+    model.fit(X_tr_mc, y_tr_mc)
+    Z = model.predict(np.c_[xx.ravel(), yy.ravel()]).reshape(xx.shape)
+    ax.contourf(xx, yy, Z, alpha=0.35, cmap='RdBu_r')
+    ax.scatter(X_mc[:, 0], X_mc[:, 1], c=y_mc, cmap='RdBu_r',
+               edgecolors='black', s=35, alpha=0.8)
+    test_acc = model.score(X_te_mc, y_te_mc)
+    train_acc = model.score(X_tr_mc, y_tr_mc)
+    ax.set_title(f'{name}\nTrain: {train_acc:.3f} | Test: {test_acc:.3f}', fontsize=11)
+    ax.set_xlabel('X1'); ax.set_ylabel('X2')
+    ax.grid(True, alpha=0.2)
+
+plt.tight_layout()
+plt.show()
+```
+
+::: {.callout-note}
+## ¿Qué observar en estas fronteras?
+
+- **Árbol individual**: frontera angular, irregular, posiblemente sobreajustada
+- **Bagging**: frontera más suave, promedio de muchas fronteras angulares
+- **Random Forest**: frontera más suave aún, gracias a la decorrelación entre árboles
+
+La mejora de Bagging a Random Forest suele ser notable cuando hay muchas variables y algunas dominantes.
+:::
+
+---
+
+## Ventajas y Limitaciones
+
+### Ventajas
+
+1. **Robusto al sobreajuste**: agregar más árboles nunca empeora el desempeño
+2. **Sin ajuste fino requerido**: los defaults suelen funcionar bien directamente
+3. **OOB estima la generalización** sin reservar datos de validación
+4. **Paralelizable**: cada árbol es independiente, se puede entrenar en paralelo
+5. **Importancia de variables** robusta y estable (promediada sobre cientos de árboles)
+6. **Maneja variables mixtas** y datos con ruido
+
+### Limitaciones
+
+1. **No extrapola** más allá del rango de entrenamiento
+2. **Menos interpretable** que un árbol individual (no hay una regla IF-THEN legible)
+3. **Costoso en predicción** si $B$ es grande y la latencia importa
+4. **Subóptimo con relaciones lineales** puras — la regresión lineal las captura mejor con menos datos
+5. **Importancia MDI sesgada** hacia variables de alta cardinalidad (aplica el mismo sesgo que en árboles simples)
+
+### ¿Cuándo usar cada método?
+
+| Situación | Recomendación |
+|:---|:---|
+| Interpretabilidad crítica | Árbol de decisión (podado) |
+| Máximo desempeño, baja latencia | Random Forest |
+| Muchas variables irrelevantes | Random Forest (m pequeño) |
+| Pocas variables, todas relevantes | Bagging puede ser suficiente |
+| Relaciones principalmente lineales | Regresión regularizada (Ridge/Lasso) |
+
+---
